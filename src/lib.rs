@@ -40,7 +40,10 @@ pub enum Replay<T> {
     Contiguous(Vec<(u64, T)>),
     /// Entries after the requested seq were evicted. `first_retained_seq` is
     /// the oldest seq still held, so the caller can size the hole.
-    Gap { first_retained_seq: u64, retained: Vec<(u64, T)> },
+    Gap {
+        first_retained_seq: u64,
+        retained: Vec<(u64, T)>,
+    },
 }
 
 impl<T> Replay<T> {
@@ -66,7 +69,10 @@ impl<T: Clone + Send + 'static> DeliveryLog<T> {
     /// arrived, and `tokio::sync::broadcast` rejects a zero capacity.
     pub fn new(retention: usize, live_capacity: usize) -> Self {
         assert!(retention > 0, "DeliveryLog retention must be non-zero");
-        assert!(live_capacity > 0, "DeliveryLog live_capacity must be non-zero");
+        assert!(
+            live_capacity > 0,
+            "DeliveryLog live_capacity must be non-zero"
+        );
         let (live, _) = broadcast::channel(live_capacity);
         Self {
             inner: Mutex::new(DeliveryLogInner {
@@ -124,7 +130,10 @@ impl<T: Clone + Send + 'static> DeliveryLog<T> {
     }
 
     pub fn next_seq(&self) -> u64 {
-        self.inner.lock().expect("DeliveryLog mutex poisoned").next_seq
+        self.inner
+            .lock()
+            .expect("DeliveryLog mutex poisoned")
+            .next_seq
     }
 
     /// Catch up and subscribe under one lock, so no item can slip between the
@@ -166,7 +175,10 @@ mod tests {
         log.push("a".to_string());
         log.push("b".to_string());
         let (replay, _rx) = log.subscribe_with_replay(None);
-        assert_eq!(replay, Replay::Contiguous(vec![(0, "a".to_string()), (1, "b".to_string())]));
+        assert_eq!(
+            replay,
+            Replay::Contiguous(vec![(0, "a".to_string()), (1, "b".to_string())])
+        );
     }
 
     #[test]
@@ -176,7 +188,10 @@ mod tests {
         log.push("b".to_string());
         log.push("c".to_string());
         let (replay, _rx) = log.subscribe_with_replay(Some(0));
-        assert_eq!(replay, Replay::Contiguous(vec![(1, "b".to_string()), (2, "c".to_string())]));
+        assert_eq!(
+            replay,
+            Replay::Contiguous(vec![(1, "b".to_string()), (2, "c".to_string())])
+        );
     }
 
     #[test]
@@ -218,7 +233,11 @@ mod tests {
         let (replay, _rx) = log.subscribe_with_replay(None);
         let retained = replay.retained();
         assert_eq!(retained.len(), RETENTION);
-        assert_eq!(retained.first().unwrap().0, 1, "seq 0 must have been evicted to stay within retention");
+        assert_eq!(
+            retained.first().unwrap().0,
+            1,
+            "seq 0 must have been evicted to stay within retention"
+        );
         assert_eq!(retained.last().unwrap().0, RETENTION as u64);
     }
 
@@ -235,11 +254,16 @@ mod tests {
         // Resuming from seq 0 needs seq 1 onward, but seq 1 was evicted too.
         let (replay, _rx) = log.subscribe_with_replay(Some(0));
         match replay {
-            Replay::Gap { first_retained_seq, retained } => {
+            Replay::Gap {
+                first_retained_seq,
+                retained,
+            } => {
                 assert_eq!(first_retained_seq, 2);
                 assert_eq!(retained.len(), RETENTION);
             }
-            Replay::Contiguous(_) => panic!("expected a Gap: seq 1 was evicted and resuming from seq 0 needs it"),
+            Replay::Contiguous(_) => {
+                panic!("expected a Gap: seq 1 was evicted and resuming from seq 0 needs it")
+            }
         }
     }
 
@@ -250,7 +274,10 @@ mod tests {
             log.push(i);
         }
         let (replay, _rx) = log.subscribe_with_replay(None);
-        assert!(!replay.is_gap(), "None must always mean 'everything currently retained', never an error");
+        assert!(
+            !replay.is_gap(),
+            "None must always mean 'everything currently retained', never an error"
+        );
     }
 
     #[test]
@@ -301,7 +328,11 @@ mod tests {
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
         ));
         let retained = log.replay_since(None).retained();
-        assert_eq!(retained.len(), 8, "retention is unaffected by the live channel lagging");
+        assert_eq!(
+            retained.len(),
+            8,
+            "retention is unaffected by the live channel lagging"
+        );
     }
 
     #[test]
