@@ -6,6 +6,13 @@
 //! a subscriber asks for, the answer is an explicit [`Replay::Gap`] rather than
 //! a silently partial replay.
 //!
+//! Every log also has an [`epoch`](DeliveryLog::epoch): a random id minted
+//! when it is created. A seq means something only within one log, so a reader
+//! that keeps its place across the log being replaced (the producer restarted,
+//! or the log was dropped and created again) should hold a [`Cursor`] and ask
+//! [`DeliveryLog::replay_from`], which answers another log's cursor with
+//! [`Replay::Gap`] instead of treating its seq as one of this log's.
+//!
 //! This crate is protocol-agnostic: it knows nothing about what `T` is.
 
 use std::collections::VecDeque;
@@ -19,9 +26,18 @@ pub const DEFAULT_RETENTION: usize = 1024;
 /// size. See [`DeliveryLog::with_defaults`].
 pub const DEFAULT_LIVE_CAPACITY: usize = 256;
 
+/// Where a reader stands in one particular log: that log's
+/// [`epoch`](DeliveryLog::epoch) and the last seq the reader has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor<'a> {
+    pub epoch: &'a str,
+    pub seq: u64,
+}
+
 pub struct DeliveryLog<T: Clone + Send + 'static> {
     inner: Mutex<DeliveryLogInner<T>>,
     retention: usize,
+    epoch: String,
 }
 
 struct DeliveryLogInner<T> {
@@ -38,8 +54,11 @@ pub enum Replay<T> {
     /// Every item after the requested seq is present, in order, with no hole.
     /// Always the answer for `None`, and for an empty log.
     Contiguous(Vec<(u64, T)>),
-    /// Entries after the requested seq were evicted. `first_retained_seq` is
-    /// the oldest seq still held, so the caller can size the hole.
+    /// Entries after the requested seq were evicted, or (from
+    /// [`DeliveryLog::replay_from`]) the cursor belongs to another log or
+    /// points past this one. `first_retained_seq` is the oldest seq still
+    /// held (the next seq to be written, when the log holds nothing), so the
+    /// caller can size the hole.
     Gap {
         first_retained_seq: u64,
         retained: Vec<(u64, T)>,
@@ -81,6 +100,7 @@ impl<T: Clone + Send + 'static> DeliveryLog<T> {
                 live,
             }),
             retention,
+            epoch: uuid::Uuid::new_v4().simple().to_string(),
         }
     }
 
@@ -127,6 +147,34 @@ impl<T: Clone + Send + 'static> DeliveryLog<T> {
     pub fn replay_since(&self, last_seen_seq: Option<u64>) -> Replay<T> {
         let inner = self.inner.lock().expect("DeliveryLog mutex poisoned");
         Self::replay_locked(&inner.entries, last_seen_seq)
+    }
+
+    /// This log's epoch: 32 lowercase hex characters, random, fixed for the
+    /// log's lifetime. Two logs never share one.
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
+    /// Like [`replay_since`](Self::replay_since), but for a reader that names
+    /// the log its seq came from. A cursor from another epoch, or one at or
+    /// past [`next_seq`](Self::next_seq), was never part of this log's
+    /// history: the answer is [`Replay::Gap`] with everything retained, so the
+    /// reader rebuilds from a baseline.
+    pub fn replay_from(&self, cursor: Option<Cursor<'_>>) -> Replay<T> {
+        let inner = self.inner.lock().expect("DeliveryLog mutex poisoned");
+        match cursor {
+            Some(cursor) if cursor.epoch != self.epoch || cursor.seq >= inner.next_seq => {
+                Replay::Gap {
+                    first_retained_seq: inner
+                        .entries
+                        .front()
+                        .map(|(seq, _)| *seq)
+                        .unwrap_or(inner.next_seq),
+                    retained: inner.entries.iter().cloned().collect(),
+                }
+            }
+            cursor => Self::replay_locked(&inner.entries, cursor.map(|c| c.seq)),
+        }
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -345,5 +393,96 @@ mod tests {
     #[should_panic(expected = "live_capacity must be non-zero")]
     fn zero_live_capacity_is_rejected() {
         let _ = DeliveryLog::<u64>::new(4, 0);
+    }
+
+    #[test]
+    fn every_log_has_its_own_32_hex_epoch() {
+        let a: DeliveryLog<String> = DeliveryLog::with_defaults();
+        let b: DeliveryLog<String> = DeliveryLog::with_defaults();
+        assert_eq!(a.epoch().len(), 32);
+        assert!(a
+            .epoch()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(a.epoch(), b.epoch());
+        assert_eq!(a.epoch(), a.epoch(), "an epoch never changes for a log");
+    }
+
+    #[test]
+    fn replay_from_the_same_epoch_matches_replay_since() {
+        let log = DeliveryLog::new(3, 4);
+        for s in ["a", "b", "c", "d", "e"] {
+            log.push(s.to_string());
+        }
+        let epoch = log.epoch().to_string();
+        for seq in [None, Some(0), Some(1), Some(2), Some(3)] {
+            let cursor = seq.map(|seq| Cursor { epoch: &epoch, seq });
+            assert_eq!(
+                log.replay_from(cursor),
+                log.replay_since(seq),
+                "seq {seq:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cursor_from_another_epoch_is_a_gap_with_everything_retained() {
+        let log = DeliveryLog::new(4, 4);
+        log.push("a".to_string());
+        log.push("b".to_string());
+        let replay = log.replay_from(Some(Cursor {
+            epoch: "00000000000000000000000000000000",
+            seq: 0,
+        }));
+        assert_eq!(
+            replay,
+            Replay::Gap {
+                first_retained_seq: 0,
+                retained: vec![(0, "a".to_string()), (1, "b".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn a_cursor_from_another_epoch_is_a_gap_even_on_an_empty_log() {
+        let log: DeliveryLog<String> = DeliveryLog::with_defaults();
+        let replay = log.replay_from(Some(Cursor {
+            epoch: "00000000000000000000000000000000",
+            seq: 7,
+        }));
+        assert_eq!(
+            replay,
+            Replay::Gap {
+                first_retained_seq: 0,
+                retained: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn a_cursor_ahead_of_the_log_is_a_gap() {
+        let log = DeliveryLog::new(4, 4);
+        log.push("a".to_string());
+        let epoch = log.epoch().to_string();
+        // seq 0 exists, so a cursor at 0 is current; 1 and beyond were never written.
+        assert_eq!(
+            log.replay_from(Some(Cursor {
+                epoch: &epoch,
+                seq: 0
+            })),
+            Replay::Contiguous(vec![])
+        );
+        assert!(log
+            .replay_from(Some(Cursor {
+                epoch: &epoch,
+                seq: 1
+            }))
+            .is_gap());
+        assert!(log
+            .replay_from(Some(Cursor {
+                epoch: &epoch,
+                seq: 99
+            }))
+            .is_gap());
     }
 }

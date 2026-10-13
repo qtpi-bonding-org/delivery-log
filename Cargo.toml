@@ -1,12 +1,13 @@
 [package]
 name = "delivery-log"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-description = "Generic ordered, replayable, broadcast delivery log: a bounded ring buffer with an explicit Gap signal and race-free subscribe-plus-catch-up."
+description = "Generic ordered, replayable, broadcast delivery log: a bounded ring buffer with an explicit Gap signal and race-free subscribe-plus-catch-up, and a per-log epoch so a cursor from another log is never mistaken for one of this log's."
 license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["sync"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt"] }
