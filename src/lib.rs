@@ -15,7 +15,7 @@
 //!
 //! This crate is protocol-agnostic: it knows nothing about what `T` is.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use tokio::sync::broadcast;
 
@@ -41,9 +41,21 @@ pub struct DeliveryLog<T: Clone + Send + 'static> {
 }
 
 struct DeliveryLogInner<T> {
-    entries: VecDeque<(u64, T)>,
+    entries: BTreeMap<u64, Retained<T>>,
+    keys: HashMap<String, u64>,
     next_seq: u64,
     live: broadcast::Sender<(u64, T)>,
+}
+
+struct Retained<T> {
+    key: Option<String>,
+    item: T,
+}
+
+fn collect<'a, T: Clone + 'a>(
+    entries: impl Iterator<Item = (&'a u64, &'a Retained<T>)>,
+) -> Vec<(u64, T)> {
+    entries.map(|(seq, r)| (*seq, r.item.clone())).collect()
 }
 
 /// The outcome of a replay request. `Gap` means the caller's `last_seen_seq`
@@ -95,7 +107,8 @@ impl<T: Clone + Send + 'static> DeliveryLog<T> {
         let (live, _) = broadcast::channel(live_capacity);
         Self {
             inner: Mutex::new(DeliveryLogInner {
-                entries: VecDeque::new(),
+                entries: BTreeMap::new(),
+                keys: HashMap::new(),
                 next_seq: 0,
                 live,
             }),
@@ -116,28 +129,68 @@ impl<T: Clone + Send + 'static> DeliveryLog<T> {
     }
 
     pub fn push(&self, item: T) -> u64 {
+        self.push_inner(None, item)
+    }
+
+    /// Like [`push`](Self::push), but the earlier retained entry with the same
+    /// `key`, if there is one, is dropped from the retained buffer, so a hot
+    /// item is retained once however often it is pushed. Live subscribers still
+    /// receive every push, and seqs keep increasing; only a read of the retained
+    /// entries skips the replaced seqs. [`forget_key`](Self::forget_key) ends
+    /// the replacement chain.
+    pub fn push_keyed(&self, key: impl Into<String>, item: T) -> u64 {
+        self.push_inner(Some(key.into()), item)
+    }
+
+    /// A later [`push_keyed`](Self::push_keyed) of `key` replaces nothing pushed
+    /// before this call, so entries on either side of a removal both stay.
+    pub fn forget_key(&self, key: &str) {
+        let mut inner = self.inner.lock().expect("DeliveryLog mutex poisoned");
+        inner.keys.remove(key);
+    }
+
+    fn push_inner(&self, key: Option<String>, item: T) -> u64 {
         let mut inner = self.inner.lock().expect("DeliveryLog mutex poisoned");
         let seq = inner.next_seq;
         inner.next_seq += 1;
-        inner.entries.push_back((seq, item.clone()));
-        if inner.entries.len() > self.retention {
-            inner.entries.pop_front();
+        if let Some(key) = &key {
+            if let Some(earlier) = inner.keys.insert(key.clone(), seq) {
+                inner.entries.remove(&earlier);
+            }
+        }
+        inner.entries.insert(
+            seq,
+            Retained {
+                key,
+                item: item.clone(),
+            },
+        );
+        while inner.entries.len() > self.retention {
+            let Some((evicted_seq, evicted)) = inner.entries.pop_first() else {
+                break;
+            };
+            if let Some(key) = evicted.key {
+                if inner.keys.get(&key) == Some(&evicted_seq) {
+                    inner.keys.remove(&key);
+                }
+            }
         }
         let _ = inner.live.send((seq, item));
         seq
     }
 
-    fn replay_locked(entries: &VecDeque<(u64, T)>, last_seen_seq: Option<u64>) -> Replay<T> {
-        let first_retained_seq = entries.front().map(|(s, _)| *s);
+    fn replay_locked(
+        entries: &BTreeMap<u64, Retained<T>>,
+        last_seen_seq: Option<u64>,
+    ) -> Replay<T> {
+        let first_retained_seq = entries.keys().next().copied();
         match (last_seen_seq, first_retained_seq) {
             (Some(seq), Some(first)) if seq + 1 < first => Replay::Gap {
                 first_retained_seq: first,
-                retained: entries.iter().cloned().collect(),
+                retained: collect(entries.iter()),
             },
-            (None, _) => Replay::Contiguous(entries.iter().cloned().collect()),
-            (Some(seq), _) => {
-                Replay::Contiguous(entries.iter().filter(|(s, _)| *s > seq).cloned().collect())
-            }
+            (None, _) => Replay::Contiguous(collect(entries.iter())),
+            (Some(seq), _) => Replay::Contiguous(collect(entries.range(seq + 1..))),
         }
     }
 
@@ -167,10 +220,11 @@ impl<T: Clone + Send + 'static> DeliveryLog<T> {
                 Replay::Gap {
                     first_retained_seq: inner
                         .entries
-                        .front()
-                        .map(|(seq, _)| *seq)
+                        .keys()
+                        .next()
+                        .copied()
                         .unwrap_or(inner.next_seq),
-                    retained: inner.entries.iter().cloned().collect(),
+                    retained: collect(inner.entries.iter()),
                 }
             }
             cursor => Self::replay_locked(&inner.entries, cursor.map(|c| c.seq)),
@@ -484,5 +538,104 @@ mod tests {
                 seq: 99
             }))
             .is_gap());
+    }
+
+    fn retained_of(log: &DeliveryLog<String>) -> Vec<(u64, String)> {
+        log.subscribe_with_replay(None).0.retained()
+    }
+
+    #[test]
+    fn a_keyed_push_replaces_the_earlier_retained_entry_of_its_key() {
+        let log = DeliveryLog::<String>::with_defaults();
+        log.push_keyed("a", "a1".to_string());
+        log.push("other".to_string());
+        log.push_keyed("a", "a2".to_string());
+        assert_eq!(
+            retained_of(&log),
+            vec![(1, "other".to_string()), (2, "a2".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_broadcast_still_carries_every_push() {
+        let log = DeliveryLog::<String>::with_defaults();
+        let (_replay, mut rx) = log.subscribe_with_replay(None);
+        log.push_keyed("a", "a1".to_string());
+        log.push_keyed("a", "a2".to_string());
+        assert_eq!(rx.recv().await.unwrap(), (0, "a1".to_string()));
+        assert_eq!(rx.recv().await.unwrap(), (1, "a2".to_string()));
+    }
+
+    #[test]
+    fn seqs_keep_increasing_and_the_retained_tail_skips() {
+        let log = DeliveryLog::<String>::with_defaults();
+        log.push("x".to_string());
+        for i in 0..5 {
+            assert_eq!(log.push_keyed("hot", format!("h{i}")), 1 + i);
+        }
+        assert_eq!(log.next_seq(), 6);
+        assert_eq!(
+            retained_of(&log),
+            vec![(0, "x".to_string()), (5, "h4".to_string())]
+        );
+    }
+
+    #[test]
+    fn forget_key_stops_a_later_push_replacing_across_the_removal() {
+        let log = DeliveryLog::<String>::with_defaults();
+        log.push_keyed("n", "put1".to_string());
+        log.forget_key("n");
+        log.push("removed".to_string());
+        log.push_keyed("n", "put2".to_string());
+        assert_eq!(
+            retained_of(&log),
+            vec![
+                (0, "put1".to_string()),
+                (1, "removed".to_string()),
+                (2, "put2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn retention_counts_retained_entries_only() {
+        let log = DeliveryLog::<u64>::new(3, 16);
+        for i in 0..100 {
+            log.push_keyed("hot", i);
+        }
+        log.push(1000);
+        log.push(1001);
+        let retained = log.subscribe_with_replay(None).0.retained();
+        assert_eq!(
+            retained,
+            vec![(99, 99), (100, 1000), (101, 1001)],
+            "the hot item stays while the log holds fewer entries than its retention"
+        );
+        log.push(1002);
+        let retained = log.subscribe_with_replay(None).0.retained();
+        assert_eq!(retained.first().unwrap().0, 100);
+        log.push_keyed("hot", 7);
+        assert_eq!(log.subscribe_with_replay(None).0.retained().len(), 3);
+    }
+
+    #[test]
+    fn an_unkeyed_push_is_unchanged() {
+        let log = DeliveryLog::<String>::with_defaults();
+        log.push("a".to_string());
+        log.push("a".to_string());
+        assert_eq!(retained_of(&log).len(), 2);
+    }
+
+    #[test]
+    fn an_evicted_keyed_entry_frees_its_key() {
+        let log = DeliveryLog::<u64>::new(2, 16);
+        log.push_keyed("k", 1);
+        log.push(2);
+        log.push(3);
+        log.push_keyed("k", 4);
+        assert_eq!(
+            log.subscribe_with_replay(None).0.retained(),
+            vec![(2, 3), (3, 4)]
+        );
     }
 }
