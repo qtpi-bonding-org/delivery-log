@@ -1,0 +1,63 @@
+id: delivery-log
+verified_at: 63fcdb5
+public:
+  name: delivery-log
+  summary: Rust library for an in-memory, replayable broadcast log with an explicit Gap signal when a reader
+    falls behind.
+  status: active
+  stage: prototype
+  stack:
+  - Rust
+  links:
+  - type: repo
+    url: https://github.com/qtpi-bonding-org/delivery-log
+private:
+  started: 2026-09
+  visibility: public
+  license: MIT
+  ownership: designed and directed; code written with AI assistance
+  build: agentic
+facts:
+- id: seq-and-bounded-retention
+  assertion: push and push_keyed give each item a u64 seq starting at 0, and seqs are never reused after
+    eviction. The log keeps at most `retention` entries in memory and evicts the lowest seq first. new(retention,
+    live_capacity) panics if either argument is zero, and with_defaults uses 1024 retention and 256 live
+    capacity. Nothing is persisted.
+  evidence:
+  - src/lib.rs
+- id: replay-gap-on-eviction
+  assertion: replay_since and subscribe_with_replay return Replay::Gap, with every retained entry, when
+    the last seen seq plus one is below the oldest retained seq, and Replay::Contiguous otherwise. None
+    returns everything retained. replay_since does not flag a last seen seq past the end of the log; it
+    returns an empty Contiguous.
+  evidence:
+  - src/lib.rs
+- id: subscribe-with-replay-atomic-live
+  assertion: subscribe_with_replay takes the replay snapshot and the broadcast receiver under the same
+    mutex that push holds while it sends, so a concurrent push reaches the caller through exactly one
+    of the two. A receiver more than live_capacity behind gets RecvError::Lagged and push does not block
+    on it; the crate does not recover from that itself, the caller uses replay_since.
+  evidence:
+  - src/lib.rs
+- id: keyed-push-replaces-retained-entry
+  assertion: push_keyed drops the earlier retained entry with the same key, so retained reads hold at most
+    one entry per key chain. Live receivers still get every push and the replaced seq is still consumed.
+    forget_key ends the replacement chain, and an evicted keyed entry frees its key. Keys are held in
+    memory only.
+  evidence:
+  - src/lib.rs
+- id: epoch-and-replay-from
+  assertion: Each log gets a random 32-hex epoch (a UUIDv4) when it is created. replay_from returns Gap
+    with everything retained when the cursor's epoch differs from the log's or its seq is at or past
+    next_seq, and otherwise behaves as replay_since. replay_since and subscribe_with_replay take no epoch
+    and cannot detect a cursor from another log.
+  evidence:
+  - src/lib.rs
+- id: in-memory-sync-core-on-tokio-broadcast
+  assertion: The log is a synchronous in-memory library, with a BTreeMap and a HashMap behind a std Mutex
+    and no disk or network I/O. It depends on tokio (feature sync only, for broadcast) and uuid (v4).
+    Pushing and replaying need no async runtime; only awaiting a live receiver does. The item type must
+    be Clone + Send + 'static.
+  evidence:
+  - src/lib.rs
+  - Cargo.toml
