@@ -2,7 +2,7 @@
 name = "delivery-log"
 version = "0.1.1"
 edition = "2021"
-description = "Generic ordered, replayable, broadcast delivery log: a bounded ring buffer with an explicit Gap signal and race-free subscribe-plus-catch-up, and a per-log epoch so a cursor from another log is never mistaken for one of this log's."
+description = "Generic ordered, replayable, broadcast delivery log: a count-bounded in-memory buffer with an explicit Gap signal and race-free subscribe-plus-catch-up, and a per-log epoch so replay_from never mistakes a cursor from another log for one of this log's."
 license = "MIT"
 
 [dependencies]

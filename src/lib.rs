@@ -63,10 +63,13 @@ fn collect<'a, T: Clone + 'a>(
 /// stitch `retained` onto its old state as if nothing were missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Replay<T> {
-    /// Every item after the requested seq is present, in order, with no hole.
-    /// Always the answer for `None`, and for an empty log.
+    /// Every item still retained after the requested seq is present, in order.
+    /// Seqs replaced by [`DeliveryLog::push_keyed`] are absent by design and
+    /// are not a hole. The answer for `None`, and for `replay_since` on an
+    /// empty log (`replay_from` with a cursor on an empty log is a `Gap`).
     Contiguous(Vec<(u64, T)>),
-    /// Entries after the requested seq were evicted, or (from
+    /// Entries after the requested seq were evicted (or, conservatively,
+    /// replaced by a keyed push while older ones were evicted), or (from
     /// [`DeliveryLog::replay_from`]) the cursor belongs to another log or
     /// points past this one. `first_retained_seq` is the oldest seq still
     /// held (the next seq to be written, when the log holds nothing), so the
@@ -203,7 +206,8 @@ impl<T: Clone + Send + 'static> DeliveryLog<T> {
     }
 
     /// This log's epoch: 32 lowercase hex characters, random, fixed for the
-    /// log's lifetime. Two logs never share one.
+    /// log's lifetime. Random (a UUIDv4), so two logs share one only with
+    /// negligible probability.
     pub fn epoch(&self) -> &str {
         &self.epoch
     }
