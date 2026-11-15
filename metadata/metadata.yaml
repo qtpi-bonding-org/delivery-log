@@ -11,12 +11,6 @@ public:
   links:
   - type: repo
     url: https://github.com/qtpi-bonding-org/delivery-log
-private:
-  started: 2026-09
-  visibility: public
-  license: MIT
-  ownership: designed and directed; code written with AI assistance
-  build: agentic
 facts:
 - id: seq-and-bounded-retention
   assertion: push and push_keyed give each item a u64 seq starting at 0, and seqs are never reused after
